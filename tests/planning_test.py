@@ -9,6 +9,7 @@ import torch
 from eb_jepa.planning import (
     CEMPlanner,
     GCAgent,
+    GradientDescentPlanner,
     PlanningResult,
     ReprTargetDistMPCObjective,
     main_eval,
@@ -387,3 +388,100 @@ def test_planning_integration():
 
     # Since our dummy model favors larger actions, the planned actions should have magnitude > 0
     assert torch.sum(torch.abs(action)) > 0, "Agent should select non-zero actions"
+
+
+def test_gradient_descent_planner():
+    """Test the GradientDescentPlanner class."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Differentiable mock unroll: must build a computation graph from actions
+    def mock_unroll(obs_init, actions):
+        batch_size = actions.shape[0]
+        time_steps = actions.shape[2]
+        # Create output that depends on actions so gradients flow
+        base = torch.ones(batch_size, 16, time_steps, 8, 8, device=actions.device)
+        return base * actions.mean(dim=1, keepdim=True).unsqueeze(-1).unsqueeze(-1)
+
+    # Differentiable objective: MSE to a target of ones
+    target = torch.ones(1, 16, 1, 8, 8, device=device)
+    objective = ReprTargetDistMPCObjective(target, sum_all_diffs=True)
+
+    # Test 1: Basic initialization and planning
+    planner = GradientDescentPlanner(
+        unroll=mock_unroll,
+        n_iters=10,
+        plan_length=5,
+        action_dim=2,
+        lr=0.1,
+        optimizer_type="adam",
+        decode_each_iteration=False,
+    )
+    planner.set_objective(objective)
+
+    obs_init = torch.zeros(1, 16, 1, 8, 8, device=device)
+    result = planner.plan(obs_init)
+
+    # Check return type and shape
+    assert isinstance(result, PlanningResult), "Should return a PlanningResult"
+    assert result.actions.shape == (
+        5,
+        2,
+    ), f"Actions should have shape (5, 2) but have shape {result.actions.shape}"
+    assert isinstance(result.losses, torch.Tensor), "Losses should be a tensor"
+    assert result.losses.shape[0] == 10, "Should have one loss per iteration"
+
+    # Test 2: Loss should decrease over iterations (basic sanity)
+    losses = result.losses.squeeze().tolist()
+    assert (
+        losses[-1] < losses[0]
+    ), f"Loss should decrease: first={losses[0]:.4f}, last={losses[-1]:.4f}"
+
+    # Test 3: Planning with steps_left parameter
+    result_with_steps = planner.plan(obs_init, steps_left=2)
+    assert result_with_steps.actions.shape == (
+        2,
+        2,
+    ), f"Actions should adapt to steps_left but have shape {result_with_steps.actions.shape}"
+
+    # Test 4: Verify cost function works
+    actions_batch = torch.randn(1, 2, 5, device=device, requires_grad=True)
+    cost = planner.cost_function(actions_batch, obs_init)
+    assert cost.shape == (1,), "Cost should have shape (1,) for single batch"
+    cost.backward()
+    assert actions_batch.grad is not None, "Gradients should flow to actions"
+
+    # Test 5: SGD optimizer variant
+    planner_sgd = GradientDescentPlanner(
+        unroll=mock_unroll,
+        n_iters=10,
+        plan_length=5,
+        action_dim=2,
+        lr=0.01,
+        optimizer_type="sgd",
+        decode_each_iteration=False,
+    )
+    planner_sgd.set_objective(objective)
+    result_sgd = planner_sgd.plan(obs_init)
+    assert result_sgd.actions.shape == (
+        5,
+        2,
+    ), "SGD variant should produce valid actions"
+
+    # Test 6: Norm clamping
+    planner_normed = GradientDescentPlanner(
+        unroll=mock_unroll,
+        n_iters=10,
+        plan_length=5,
+        action_dim=2,
+        lr=0.5,
+        optimizer_type="adam",
+        max_norms=[1.0],
+        decode_each_iteration=False,
+    )
+    planner_normed.set_objective(objective)
+    result_normed = planner_normed.plan(obs_init)
+    # Check that action norms per-timestep are <= max_norm + epsilon
+    norms = result_normed.actions.norm(dim=1)  # [T]
+    assert torch.all(
+        norms <= 1.0 + 1e-5
+    ), f"Action norms should be <= 1.0 but got max {norms.max().item():.4f}"

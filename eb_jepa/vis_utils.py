@@ -731,8 +731,10 @@ def plot_losses(
         return
 
     losses_arr = torch.stack(losses, dim=0).detach().cpu().numpy()
-    elite_mean_arr = torch.stack(elite_losses_mean, dim=0).detach().cpu().numpy()
-    elite_std_arr = torch.stack(elite_losses_std, dim=0).detach().cpu().numpy()
+    has_elite = elite_losses_mean and elite_losses_mean[0].numel() > 0
+    if has_elite:
+        elite_mean_arr = torch.stack(elite_losses_mean, dim=0).detach().cpu().numpy()
+        elite_std_arr = torch.stack(elite_losses_std, dim=0).detach().cpu().numpy()
     n_timesteps, n_opt_steps, n_losses = losses_arr.shape
 
     sns.set_theme()
@@ -749,23 +751,25 @@ def plot_losses(
             ax = plt.subplot(1, cols, j + 1)
             if n_opt_steps > 1:
                 sns.lineplot(data=losses_arr[step, :, i])
-                sns.lineplot(data=elite_mean_arr[step, :, i])
-                ax.fill_between(
-                    range(n_opt_steps),
-                    elite_mean_arr[step, :, i] - elite_std_arr[step, :, i],
-                    elite_mean_arr[step, :, i] + elite_std_arr[step, :, i],
-                    alpha=0.3,
-                )
+                if has_elite:
+                    sns.lineplot(data=elite_mean_arr[step, :, i])
+                    ax.fill_between(
+                        range(n_opt_steps),
+                        elite_mean_arr[step, :, i] - elite_std_arr[step, :, i],
+                        elite_mean_arr[step, :, i] + elite_std_arr[step, :, i],
+                        alpha=0.3,
+                    )
             else:
                 ax.bar(0, losses_arr[step, 0, i])
-                ax.bar(0, elite_mean_arr[step, 0, i])
-                ax.errorbar(
-                    0,
-                    elite_mean_arr[step, 0, i],
-                    yerr=elite_std_arr[step, 0, i],
-                    fmt="none",
-                    capsize=5,
-                )
+                if has_elite:
+                    ax.bar(0, elite_mean_arr[step, 0, i])
+                    ax.errorbar(
+                        0,
+                        elite_mean_arr[step, 0, i],
+                        yerr=elite_std_arr[step, 0, i],
+                        fmt="none",
+                        capsize=5,
+                    )
 
             ax.set_title(f"Step {step * frameskip * num_act_stepped}")
             ax.tick_params(axis="both")

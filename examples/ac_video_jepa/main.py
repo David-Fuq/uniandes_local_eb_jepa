@@ -267,13 +267,15 @@ def run(
         if not enable_eval:
             raise ValueError("eval_only_mode requires enable_plan_eval=True")
         logger.info("Running evaluation only (no training)")
+        planner_suffix = plan_cfg["planner"]["planner_name"].upper()
+        eval_suffix = f"_{planner_suffix}_eval_only"
         eval_results = launch_unroll_eval(
             jepa,
             env_creator,
             folder,
             start_epoch,
             ckpt_info.get("step", 0),
-            "_eval_only",
+            eval_suffix,
             val_loader,
             xy_prober,
             cfg,
@@ -285,7 +287,7 @@ def run(
                 folder,
                 start_epoch,
                 global_step=ckpt_info.get("step", 0),
-                suffix="_eval_only",
+                suffix=eval_suffix,
                 num_eval_episodes=num_eval_episodes,
                 loader=val_loader,
                 prober=xy_prober,

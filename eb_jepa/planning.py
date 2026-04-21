@@ -25,6 +25,7 @@ logger = get_logger(__name__)
 planner_name_map = {
     "cem": "CEMPlanner",
     "mppi": "MPPIPlanner",
+    "gd": "GradientDescentPlanner",
 }
 objective_name_map = {
     "repr_dist": "ReprTargetDistMPCObjective",
@@ -376,6 +377,7 @@ class GCAgent:
                     unroll=self.unroll,
                     action_dim=action_dim,
                     decode_loc_to_pixel=self.decode_loc_to_pixel,
+                    model=model,
                     **plan_cfg.planner,
                 )
             else:
@@ -794,4 +796,106 @@ class MPPIPlanner(Planner):
             losses=torch.tensor(losses).detach().unsqueeze(-1),
             prev_elite_losses_mean=torch.tensor(elite_means).unsqueeze(-1),
             prev_elite_losses_std=torch.tensor(elite_stds).unsqueeze(-1),
+        )
+
+
+class GradientDescentPlanner(Planner):
+    def __init__(
+        self,
+        unroll: Callable,
+        n_iters: int = 50,
+        plan_length: int = 15,
+        action_dim: int = 2,
+        lr: float = 0.1,
+        optimizer_type: str = "adam",
+        max_norms: Optional[List[float]] = None,
+        max_norm_dims: Optional[List[List[int]]] = None,
+        decode_each_iteration: bool = False,
+        decode_loc_to_pixel: Optional[Callable] = None,
+        model: Optional[torch.nn.Module] = None,
+        **kwargs,
+    ):
+        super().__init__(unroll)
+        self.n_iters = n_iters
+        self.plan_length = plan_length
+        self.action_dim = action_dim
+        self.lr = lr
+        self.optimizer_type = optimizer_type
+        self.max_norms = max_norms
+        self.max_norm_dims = max_norm_dims
+        self.decode_each_iteration = decode_each_iteration
+        self.decode_loc_to_pixel = decode_loc_to_pixel
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Collect RNN modules that need train mode for cuDNN backward
+        self._rnn_modules = []
+        if model is not None:
+            for m in model.modules():
+                if isinstance(m, (torch.nn.RNN, torch.nn.GRU, torch.nn.LSTM)):
+                    self._rnn_modules.append(m)
+
+    def plan(
+        self, obs_init, steps_left=None, eval_mode=True, t0=False, plan_vis_path=None
+    ):
+        if steps_left is None:
+            plan_length = self.plan_length
+        else:
+            plan_length = min(self.plan_length, steps_left)
+
+        # Temporarily set RNN modules to train mode for cuDNN backward compatibility
+        for m in self._rnn_modules:
+            m.train()
+
+        # Use enable_grad to override the outer no_grad context in main_eval
+        with torch.enable_grad():
+            actions = torch.zeros(
+                1, self.action_dim, plan_length, device=self.device, requires_grad=True
+            )  # 1 A T
+
+            if self.optimizer_type == "adam":
+                optimizer = torch.optim.Adam([actions], lr=self.lr)
+            else:
+                optimizer = torch.optim.SGD([actions], lr=self.lr)
+
+            losses = []
+            if self.decode_each_iteration:
+                pred_frames_over_iterations = []
+
+            for _ in range(self.n_iters):
+                optimizer.zero_grad()
+                cost = self.cost_function(actions, obs_init)
+                cost.backward()
+                optimizer.step()
+                losses.append(cost.item())
+
+                # Apply norm clamping after optimizer step
+                if self.max_norms is not None:
+                    with torch.no_grad():
+                        max_norm = self.max_norms[0]
+                        eps = 1e-6
+                        # actions is [1, A, T], clamp per-timestep
+                        norms = actions.data.norm(dim=1, keepdim=True)  # 1 1 T
+                        coeff = torch.clamp(norms, max=max_norm) / (norms + eps)
+                        actions.data.mul_(coeff)
+
+                if self.decode_each_iteration:
+                    with torch.no_grad():
+                        predicted_best_encs = self.unroll(obs_init, actions.detach())
+                        pred_frames = self.decode_loc_to_pixel(predicted_best_encs)
+                        pred_frames_over_iterations.append(pred_frames.squeeze(0))
+
+            if self.decode_each_iteration:
+                save_decoded_frames(pred_frames_over_iterations, losses, plan_vis_path)
+
+        # Restore RNN modules to eval mode
+        for m in self._rnn_modules:
+            m.eval()
+
+        # Detach and rearrange from [1, A, T] to [T, A]
+        a = rearrange(actions.detach(), "1 a t -> t a")
+
+        return PlanningResult(
+            actions=a,
+            losses=torch.tensor(losses).detach().unsqueeze(-1),
+            prev_elite_losses_mean=torch.tensor([]).unsqueeze(-1),
+            prev_elite_losses_std=torch.tensor([]).unsqueeze(-1),
         )
