@@ -54,7 +54,7 @@ optim:
   weight_decay: 1.e-5
 eval:
   plan_cfg_path: examples/ac_video_jepa/cfgs/planning_cem.yaml
-  eval_cfg_path: examples/ac_video_jepa/cfgs/eval.yaml
+  eval_cfg_path: examples/ac_video_jepa/cfgs/eval_multi_wall.yaml
 
 sweep:
   param_grid:

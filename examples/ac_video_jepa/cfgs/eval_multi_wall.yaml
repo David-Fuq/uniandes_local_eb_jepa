@@ -1,0 +1,11 @@
+meta:
+  num_eval_episodes: 20
+  plan_suffix: _sum_diffs
+env:
+  n_allowed_steps: 400
+  level: normal
+data:
+  env_name: two_rooms
+  n_walls: 3
+  min_wall_spacing: 12
+  fix_wall: false
