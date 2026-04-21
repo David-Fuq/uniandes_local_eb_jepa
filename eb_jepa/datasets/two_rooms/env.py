@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from .normalizer import Normalizer
-from .utils import check_wall_intersect
+from .utils import check_wall_intersect, generate_multi_wall_layouts
 from .wall_dataset import WallDatasetConfig
 
 InfoType = Dict[str, Any]
@@ -44,6 +44,7 @@ class DotWall(gym.Env):
 
         self.fix_wall_location = config.fix_wall_location
         self.fix_door_location = config.fix_door_location
+        self.n_walls = getattr(config, "n_walls", 1)
 
         self.cross_wall = cross_wall
         self.level = level
@@ -87,11 +88,14 @@ class DotWall(gym.Env):
         return self._get_obs()
 
     def reset(self, location=None) -> Tuple[ObsType, InfoType]:
-        self.wall_x, self.hole_y = self._generate_wall()
+        self.walls = self._generate_walls()
+        # Backward compat: first wall defines wall_x / hole_y
+        self.wall_x = self.walls[0][0]
+        self.hole_y = self.walls[0][1]
         self.left_wall_x = self.wall_x - self.wall_width // 2
         self.right_wall_x = self.wall_x + self.wall_width // 2
 
-        self.wall_img = self._render_walls(self.wall_x, self.hole_y)
+        self.wall_img = self._render_walls_multi(self.walls)
         if location is None:
             self._generate_start_and_target()
         else:
@@ -181,41 +185,62 @@ class DotWall(gym.Env):
 
     def _calculate_next_position(self, action):
         next_dot_position = self._generate_transition(self.dot_position, action)
-        intersect, intersect_w_noise = check_wall_intersect(
-            self.dot_position,
-            next_dot_position,
-            self.wall_x,
-            self.hole_y,
-            wall_width=self.wall_width,
-            door_space=self.door_space,
-            border_wall_loc=self.border_wall_loc,
-            img_size=self.img_size,
-        )
-        if intersect is not None:
-            next_dot_position = intersect_w_noise
+        nearest_intersect = None
+        nearest_intersect_w_noise = None
+        nearest_dist = float("inf")
+        for wall_x, hole_y in self.walls:
+            intersect, intersect_w_noise = check_wall_intersect(
+                self.dot_position,
+                next_dot_position,
+                wall_x,
+                hole_y,
+                wall_width=self.wall_width,
+                door_space=self.door_space,
+                border_wall_loc=self.border_wall_loc,
+                img_size=self.img_size,
+            )
+            if intersect is not None:
+                dist = torch.norm(self.dot_position - intersect)
+                if dist < nearest_dist:
+                    nearest_dist = dist
+                    nearest_intersect = intersect
+                    nearest_intersect_w_noise = intersect_w_noise
+        if nearest_intersect is not None:
+            next_dot_position = nearest_intersect_w_noise
         return next_dot_position
 
     def _generate_transition(self, location, action):
         next_location = location + action  # [..., :-1] * action[..., -1]
         return next_location
 
-    def _generate_wall(self):
+    def _generate_walls(self):
+        """
+        Returns a list of (wall_x, hole_y) tensors, one per wall.
+        """
+        if self.n_walls > 1:
+            layouts = generate_multi_wall_layouts(self.config, rng=self.rng)
+            return [
+                (
+                    torch.tensor(
+                        w["wall_pos"], device=self.device, dtype=torch.float32
+                    ),
+                    torch.tensor(
+                        w["door_pos"], device=self.device, dtype=torch.float32
+                    ),
+                )
+                for w in layouts
+            ]
+
         if self.fix_wall:
-            # Use fixed positions as before
             wall_loc = torch.tensor(self.fix_wall_location, device=self.device)
             door_loc = torch.tensor(self.fix_door_location, device=self.device)
         else:
-            # Sample random wall and door positions like WallDataset does
             from .utils import generate_wall_layouts
 
-            # Generate layouts based on config (similar to WallDataset.__init__)
             layouts, _ = generate_wall_layouts(self.config)
-
-            # Sample a random layout
             layout_codes = list(layouts.keys())
             sampled_code = self.rng.choice(layout_codes)
             layout = layouts[sampled_code]
-
             wall_loc = torch.tensor(
                 layout["wall_pos"], device=self.device, dtype=torch.float32
             )
@@ -223,99 +248,128 @@ class DotWall(gym.Env):
                 layout["door_pos"], device=self.device, dtype=torch.float32
             )
 
-        return wall_loc, door_loc
+        return [(wall_loc, door_loc)]
 
     def _generate_start_and_target(self):
         # We leave 2 * self.dot_std margin when generating state, and don't let the
         # dot approach the border.
         n_steps = self.n_steps
-        if self.cross_wall:
-            if self.level == "easy":
-                # we make sure start and goal are within (n_steps/2) steps from door
-
-                avg_dist_n_steps = n_steps * self.action_step_mean
-
-                assert (
-                    self.wall_padding - self.wall_width // 2 - self.border_wall_loc
-                    >= math.ceil(avg_dist_n_steps * 3 / 4)
-                )
-
-                start_min_x = self.left_wall_x - math.ceil(avg_dist_n_steps * 3 / 4)
-                start_max_x = self.left_wall_x - math.ceil(avg_dist_n_steps * 1 / 4)
-                target_min_x = self.right_wall_x + math.ceil(avg_dist_n_steps * 1 / 4)
-                target_max_x = self.right_wall_x + math.ceil(avg_dist_n_steps * 3 / 4)
-                min_y = max(
-                    self.hole_y - math.ceil(avg_dist_n_steps * 3 / 4),
-                    self.border_padding,
-                )
-                max_y = min(
-                    self.hole_y + math.ceil(avg_dist_n_steps * 3 / 4),
-                    self.img_size - 1 - self.border_padding,
-                )
-            else:
-                start_min_x = self.border_padding
-                start_max_x = self.left_wall_x - self.padding
-                target_min_x = self.right_wall_x + self.padding
-                target_max_x = self.img_size - 1 - self.border_padding
-                min_y, max_y = (
-                    self.border_padding,
-                    self.img_size - 1 - self.border_padding,
-                )
-
-            start_x = start_min_x + self.rng.random() * (start_max_x - start_min_x)
-            target_x = target_min_x + self.rng.random() * (target_max_x - target_min_x)
-
-            start_y = torch.tensor(
-                min_y + self.rng.random() * (max_y - min_y), device=self.device
-            )
-            target_y = torch.tensor(
-                min_y + self.rng.random() * (max_y - min_y), device=self.device
-            )
-
-            if self.rng.random() < 0.5:  # inverse travel direction 50% of time
-                start_x, target_x = target_x, start_x
-
-            self.dot_position = torch.stack([start_x, start_y])
-            self.target_position = torch.stack([target_x, target_y])
-        else:
+        if not self.cross_wall:
             raise NotImplementedError("only cross_wall=True is implemented")
 
+        if self.n_walls > 1:
+            self._generate_start_and_target_multi_wall()
+            return
+
+        if self.level == "easy":
+            # we make sure start and goal are within (n_steps/2) steps from door
+
+            avg_dist_n_steps = n_steps * self.action_step_mean
+
+            assert (
+                self.wall_padding - self.wall_width // 2 - self.border_wall_loc
+                >= math.ceil(avg_dist_n_steps * 3 / 4)
+            )
+
+            start_min_x = self.left_wall_x - math.ceil(avg_dist_n_steps * 3 / 4)
+            start_max_x = self.left_wall_x - math.ceil(avg_dist_n_steps * 1 / 4)
+            target_min_x = self.right_wall_x + math.ceil(avg_dist_n_steps * 1 / 4)
+            target_max_x = self.right_wall_x + math.ceil(avg_dist_n_steps * 3 / 4)
+            min_y = max(
+                self.hole_y - math.ceil(avg_dist_n_steps * 3 / 4),
+                self.border_padding,
+            )
+            max_y = min(
+                self.hole_y + math.ceil(avg_dist_n_steps * 3 / 4),
+                self.img_size - 1 - self.border_padding,
+            )
+        else:
+            start_min_x = self.border_padding
+            start_max_x = self.left_wall_x - self.padding
+            target_min_x = self.right_wall_x + self.padding
+            target_max_x = self.img_size - 1 - self.border_padding
+            min_y, max_y = (
+                self.border_padding,
+                self.img_size - 1 - self.border_padding,
+            )
+
+        start_x = start_min_x + self.rng.random() * (start_max_x - start_min_x)
+        target_x = target_min_x + self.rng.random() * (target_max_x - target_min_x)
+
+        start_y = torch.tensor(
+            min_y + self.rng.random() * (max_y - min_y), device=self.device
+        )
+        target_y = torch.tensor(
+            min_y + self.rng.random() * (max_y - min_y), device=self.device
+        )
+
+        if self.rng.random() < 0.5:  # inverse travel direction 50% of time
+            start_x, target_x = target_x, start_x
+
+        self.dot_position = torch.stack([start_x, start_y])
+        self.target_position = torch.stack([target_x, target_y])
+
+    def _generate_start_and_target_multi_wall(self):
+        """Sample start in leftmost room, target in rightmost room."""
+        half_w = self.wall_width // 2
+        border = self.border_padding
+        min_y = border
+        max_y = self.img_size - 1 - border
+
+        sorted_walls = sorted(self.walls, key=lambda w: w[0].item())
+        first_wall_x = sorted_walls[0][0].item()
+        last_wall_x = sorted_walls[-1][0].item()
+
+        start_min_x = border
+        start_max_x = first_wall_x - half_w - self.padding
+        target_min_x = last_wall_x + half_w + self.padding
+        target_max_x = self.img_size - 1 - border
+
+        start_x = start_min_x + self.rng.random() * (start_max_x - start_min_x)
+        target_x = target_min_x + self.rng.random() * (target_max_x - target_min_x)
+        start_y = min_y + self.rng.random() * (max_y - min_y)
+        target_y = min_y + self.rng.random() * (max_y - min_y)
+
+        start_x = torch.tensor(start_x, device=self.device)
+        target_x = torch.tensor(target_x, device=self.device)
+        start_y = torch.tensor(start_y, device=self.device)
+        target_y = torch.tensor(target_y, device=self.device)
+
+        if self.rng.random() < 0.5:
+            start_x, target_x = target_x, start_x
+
+        self.dot_position = torch.stack([start_x, start_y])
+        self.target_position = torch.stack([target_x, target_y])
+
     def _render_walls(self, wall_loc, hole_loc):
-        # Generates an image of the wall with the door and specified wall thickness.
+        # Generates an image of a single wall with door. Kept for backward compat.
+        return self._render_walls_multi([(wall_loc, hole_loc)])
+
+    def _render_walls_multi(self, walls):
+        """Render all walls and doors into a single image."""
         x = torch.arange(0, self.img_size, device=self.device)
         y = torch.arange(0, self.img_size, device=self.device)
         grid_x, grid_y = torch.meshgrid(x, y, indexing="xy")
 
-        # Calculate the range for the wall based on the wall_width
         half_width = self.wall_width // 2
+        res = torch.zeros(self.img_size, self.img_size, device=self.device)
 
-        # Create the wall mask centered at wall_loc with the given wall_width
-        wall_mask = (grid_x >= (wall_loc - half_width)) & (
-            grid_x <= (wall_loc + half_width)
-        )
+        for wall_loc, hole_loc in walls:
+            wall_mask = (grid_x >= (wall_loc - half_width)) & (
+                grid_x <= (wall_loc + half_width)
+            )
+            door_mask = (hole_loc - self.door_space <= grid_y) & (
+                grid_y <= hole_loc + self.door_space
+            )
+            res = torch.clamp(res + (wall_mask & ~door_mask).float(), 0, 1)
 
-        # Door logic remains the same
-        door_mask = (hole_loc - self.door_space <= grid_y) & (
-            grid_y <= hole_loc + self.door_space
-        )
-
-        # Combine the wall and door masks
-        res = wall_mask & ~door_mask
-
-        # Convert boolean mask to float
-        res = res.float()
-
-        # Set border walls
         border_wall_loc = self.border_wall_loc
         res[:, border_wall_loc - 1] = 1
         res[:, -border_wall_loc] = 1
         res[border_wall_loc - 1, :] = 1
         res[-border_wall_loc, :] = 1
 
-        # to byte
-
         res = (res * 255.0).clamp(0, 255).to(torch.uint8)
-
         return res
 
     def _render_dot(self, location):
@@ -410,8 +464,8 @@ class DotWall(gym.Env):
                 curr_wall_img = self._render_walls(curr_wall_x, curr_door_y)
             elif not hasattr(self, "wall_img"):
                 # Create temporary wall image without changing environment state
-                wall_x, hole_y = self._generate_wall()
-                curr_wall_img = self._render_walls(wall_x, hole_y)
+                walls = self._generate_walls()
+                curr_wall_img = self._render_walls_multi(walls)
             else:
                 # Use existing wall image
                 curr_wall_img = self.wall_img

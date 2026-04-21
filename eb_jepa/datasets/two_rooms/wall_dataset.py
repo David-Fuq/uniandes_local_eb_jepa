@@ -9,6 +9,8 @@ from scipy.stats import truncnorm
 
 from .dot_dataset import DotDataset, DotDatasetConfig
 from .utils import (
+    check_wall_intersect,
+    generate_multi_wall_layouts,
     generate_wall_layouts,
     sample_truncated_norm,
     sample_uniformly_between,
@@ -51,6 +53,8 @@ class WallDatasetConfig(DotDatasetConfig):
     num_train_layouts: Optional[int] = -1
     image_based: bool = True
     sample_length: int = 17
+    n_walls: int = 1
+    min_wall_spacing: int = 12
 
 
 class WallDataset(DotDataset):
@@ -58,6 +62,7 @@ class WallDataset(DotDataset):
         self,
         config: WallDatasetConfig,
     ):
+        self.n_walls = getattr(config, "n_walls", 1)
         layouts, other_layouts = generate_wall_layouts(config)
         self.layouts = layouts
         super().__init__(config)
@@ -671,9 +676,47 @@ class WallDataset(DotDataset):
 
         return bump_start_loc, bump_actions
 
+    def generate_state_multi_wall(self, wall_locs, door_locs, size=None):
+        """Cell-based sampling: pick a random room between walls and sample within it."""
+        if size is None:
+            size = 1
+
+        half_w = self.config.wall_width // 2
+        border = self.config.border_wall_loc - 1
+        min_y = border + 0.01
+        max_y = self.config.img_size - self.config.border_wall_loc - 0.01
+
+        sorted_wx = sorted(wall_locs.tolist())
+        boundaries = [border + 0.01]
+        for wx in sorted_wx:
+            boundaries.append(wx - half_w)
+            boundaries.append(wx + half_w)
+        boundaries.append(self.config.img_size - self.config.border_wall_loc - 0.01)
+
+        rooms = [
+            (boundaries[i], boundaries[i + 1])
+            for i in range(0, len(boundaries), 2)
+            if boundaries[i + 1] - boundaries[i] > 0.5
+        ]
+
+        location = torch.zeros(size, 2, device=self.device)
+        for s in range(size):
+            room = rooms[np.random.randint(len(rooms))]
+            x = room[0] + np.random.random() * (room[1] - room[0])
+            y = min_y + np.random.random() * (max_y - min_y)
+            location[s, 0] = x
+            location[s, 1] = y
+
+        return location
+
     def generate_state_and_actions(
         self, wall_locs=None, door_locs=None, size=None, n_steps=17
     ):
+        if self.n_walls > 1:
+            location = self.generate_state_multi_wall(wall_locs, door_locs)
+            actions, bias_angle = self.generate_actions(n_steps=n_steps)
+            return location, actions, bias_angle
+
         location, actions, bias_angle = super().generate_state_and_actions(
             wall_locs=wall_locs, door_locs=door_locs, size=size, n_steps=n_steps
         )
@@ -918,6 +961,107 @@ class WallDataset(DotDataset):
 
         return output
 
+    def _step_collision_single_wall(self, curr_loc, next_loc, walls):
+        """Original batched collision for single wall. Returns updated next_loc."""
+        left_border = torch.zeros_like(walls[0])
+        left_border[:] = self.config.border_wall_loc - 1
+        right_border = torch.zeros_like(walls[0])
+        right_border[:] = self.config.img_size - self.config.border_wall_loc
+        top_border, bot_border = left_border, right_border
+
+        check_border_intersection = (
+            (
+                (
+                    torch.sign(curr_loc[:, 0] - left_border)
+                    * torch.sign(next_loc[:, 0] - left_border)
+                )
+                <= 0
+            )
+            | (
+                (
+                    torch.sign(curr_loc[:, 0] - right_border)
+                    * torch.sign(next_loc[:, 0] - right_border)
+                )
+                <= 0
+            )
+            | (
+                (
+                    torch.sign(curr_loc[:, 1] - top_border)
+                    * torch.sign(next_loc[:, 1] - top_border)
+                )
+                <= 0
+            )
+            | (
+                (
+                    torch.sign(curr_loc[:, 1] - bot_border)
+                    * torch.sign(next_loc[:, 1] - bot_border)
+                )
+                <= 0
+            )
+        )
+
+        check_wall_intersection = self.check_wall_intersection(
+            curr_loc, next_loc, walls[0]
+        )
+
+        check_wall_width_intersection = self.check_wall_width_intersection(
+            locations=curr_loc,
+            next_locations=next_loc,
+            walls=walls[0],
+            doors=walls[1],
+        )
+
+        check_intersection = (
+            check_border_intersection
+            | check_wall_intersection
+            | check_wall_width_intersection
+        )
+
+        for j in check_intersection.nonzero():
+            if check_border_intersection[j] or check_wall_width_intersection[j]:
+                next_loc[j] = curr_loc[j].clone()
+            else:
+                if not self.check_pass_through_door(
+                    current_location=curr_loc[j][0],
+                    next_location=next_loc[j][0],
+                    wall_loc=walls[0][j],
+                    door_loc=walls[1][j],
+                ):
+                    next_loc[j] = curr_loc[j].clone()
+
+        return next_loc
+
+    def _step_collision_multi_wall(self, curr_loc, next_loc, walls):
+        """Per-sample collision for multiple walls using check_wall_intersect."""
+        bs = curr_loc.shape[0]
+        wall_locs, door_locs = walls
+        for b in range(bs):
+            pos1 = curr_loc[b]
+            pos2 = next_loc[b]
+            nearest_intersect = None
+            nearest_intersect_w_noise = None
+            nearest_dist = float("inf")
+            for w_idx in range(wall_locs.shape[0]):
+                intersect, intersect_w_noise = check_wall_intersect(
+                    pos1,
+                    pos2,
+                    wall_locs[w_idx],
+                    door_locs[w_idx],
+                    wall_width=self.config.wall_width,
+                    door_space=self.config.door_space,
+                    border_wall_loc=self.config.border_wall_loc,
+                    img_size=self.config.img_size,
+                )
+                if intersect is not None:
+                    dist = torch.norm(pos1 - intersect)
+                    if dist < nearest_dist:
+                        nearest_dist = dist
+                        nearest_intersect = intersect
+                        nearest_intersect_w_noise = intersect_w_noise
+            if nearest_intersect is not None:
+                next_loc[b] = nearest_intersect_w_noise
+        return next_loc
+
     def generate_transitions(
         self,
         location,
@@ -930,90 +1074,31 @@ class WallDataset(DotDataset):
             location: [bs, 2]
             actions: [bs, n_steps-1, 2]
             bias_angle: [bs, 2]
-            walls: tuple([bs], [bs])
+            walls: tuple(Tensor, Tensor) — for single wall: ([1], [1]), for multi: ([n_walls], [n_walls])
         """
-        # print("walls", walls)
         locations = [location]
         for i in range(actions.shape[1]):
             next_location = self.generate_transition(locations[-1], actions[:, i])
-            # print("next_location", next_location)
 
-            left_border = torch.zeros_like(walls[0])
-            left_border[:] = self.config.border_wall_loc - 1
-            right_border = torch.zeros_like(walls[0])
-            right_border[:] = self.config.img_size - self.config.border_wall_loc
-            top_border, bot_border = left_border, right_border
-
-            check_border_intersection = (
-                (
-                    (
-                        torch.sign(locations[-1][:, 0] - left_border)
-                        * torch.sign(next_location[:, 0] - left_border)
-                    )
-                    <= 0
+            if self.n_walls > 1:
+                next_location = self._step_collision_multi_wall(
+                    locations[-1], next_location, walls
                 )
-                | (
-                    (
-                        torch.sign(locations[-1][:, 0] - right_border)
-                        * torch.sign(next_location[:, 0] - right_border)
-                    )
-                    <= 0
+            else:
+                next_location = self._step_collision_single_wall(
+                    locations[-1], next_location, walls
                 )
-                | (
-                    (
-                        torch.sign(locations[-1][:, 1] - top_border)
-                        * torch.sign(next_location[:, 1] - top_border)
-                    )
-                    <= 0
-                )
-                | (
-                    (
-                        torch.sign(locations[-1][:, 1] - bot_border)
-                        * torch.sign(next_location[:, 1] - bot_border)
-                    )
-                    <= 0
-                )
-            )
-
-            check_wall_intersection = self.check_wall_intersection(
-                locations[-1], next_location, walls[0]
-            )
-
-            check_wall_width_intersection = self.check_wall_width_intersection(
-                locations=locations[-1],
-                next_locations=next_location,
-                walls=walls[0],
-                doors=walls[1],
-            )
-
-            check_intersection = (
-                check_border_intersection
-                | check_wall_intersection
-                | check_wall_width_intersection
-            )
-
-            for j in check_intersection.nonzero():
-                if check_border_intersection[j] or check_wall_width_intersection[j]:
-                    next_location[j] = locations[-1][j].clone()
-                else:
-                    if not self.check_pass_through_door(
-                        current_location=locations[-1][j][0],
-                        next_location=next_location[j][0],
-                        wall_loc=walls[0][j],
-                        door_loc=walls[1][j],
-                    ):
-                        next_location[j] = locations[-1][j].clone()
 
             locations.append(next_location)
-        wall_x = walls[0]  # (bs,)
-        door_y = walls[1]  # (bs,)
+        wall_x = walls[0]
+        door_y = walls[1]
         # Unsqueeze for compatibility with multi-dot dataset
         locations = torch.stack(locations, dim=1).unsqueeze(dim=-2)
         actions = actions.unsqueeze(dim=-2)
         states = self.render_location(locations)
-        walls = self.render_walls(*walls).unsqueeze(1).unsqueeze(1)
-        walls = walls.repeat(1, states.shape[1], 1, 1, 1)
-        states_with_walls = torch.cat([states, walls], dim=-3)
+        wall_img = self.render_walls(*walls).unsqueeze(1).unsqueeze(1)
+        wall_img = wall_img.repeat(1, states.shape[1], 1, 1, 1)
+        states_with_walls = torch.cat([states, wall_img], dim=-3)
 
         if self.config.n_steps_reduce_factor > 1:
             states_with_walls = states_with_walls[
@@ -1065,9 +1150,24 @@ class WallDataset(DotDataset):
     def sample_walls(self):
         """
         Returns:
-        wall_x: Tensor (bs). x coordinate of the wall
-        door_y: Tensor (bs). y coordinate of the door
+        wall_x: Tensor (n_walls,). x coordinates of walls
+        door_y: Tensor (n_walls,). y coordinates of doors
         """
+        if self.n_walls > 1:
+            rng = np.random.default_rng()
+            layouts = generate_multi_wall_layouts(self.config, rng=rng)
+            wall_locs = torch.tensor(
+                [w["wall_pos"] for w in layouts],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            door_locs = torch.tensor(
+                [w["door_pos"] for w in layouts],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            return (wall_locs, door_locs)
+
         layout_codes = list(self.layouts.keys())
         if self.config.fix_wall_batch_k is not None:
             layout_codes = random.sample(layout_codes, self.config.fix_wall_batch_k)
@@ -1088,49 +1188,35 @@ class WallDataset(DotDataset):
         door_locs = torch.tensor(door_locs, device=self.device)
         return (wall_locs, door_locs)
 
-    # @torch.compile
     def render_walls(self, wall_locs, hole_locs):
         """
         Params:
-            wall_locs: torch tensor size (batch_size,)
-                holds x coordinates of walls for each batch index
-            hole_locs: torch tensor size (batch_size,)
-                holds y coordinates of doors for each batch index
+            wall_locs: torch tensor — (1,) for single wall, (n_walls,) for multi
+            hole_locs: torch tensor — same shape as wall_locs
         """
         x = torch.arange(0, self.config.img_size, device=self.device)
         y = torch.arange(0, self.config.img_size, device=self.device)
         grid_x, grid_y = torch.meshgrid(x, y, indexing="xy")
-        grid_x = grid_x.unsqueeze(0)
-        grid_y = grid_y.unsqueeze(0)
 
-        wall_locs_r = wall_locs.view(1, 1, 1).repeat(
-            1, self.config.img_size, self.config.img_size
-        )
-        hole_locs_r = hole_locs.view(1, 1, 1).repeat(
-            1, self.config.img_size, self.config.img_size
-        )
-
-        # Calculate offsets for wall width
         offset = self.config.wall_width // 2
-        wall_mask = (wall_locs_r - offset <= grid_x) & (grid_x <= wall_locs_r + offset)
+        res = torch.zeros(
+            1, self.config.img_size, self.config.img_size, device=self.device
+        )
 
-        res = (
-            wall_mask
-            * (
-                (hole_locs_r < grid_y - self.config.door_space)
-                + (hole_locs_r > grid_y + self.config.door_space)
+        for w_idx in range(wall_locs.shape[0]):
+            wl = wall_locs[w_idx]
+            hl = hole_locs[w_idx]
+            wall_mask = (grid_x >= wl - offset) & (grid_x <= wl + offset)
+            door_mask = (hl - self.config.door_space <= grid_y) & (
+                grid_y <= hl + self.config.door_space
             )
-        ).float()
+            res[0] = torch.clamp(res[0] + (wall_mask & ~door_mask).float(), 0, 1)
 
-        # set border walls
         border_wall_loc = self.config.border_wall_loc
         res[:, :, border_wall_loc - 1] = 1
         res[:, :, -border_wall_loc] = 1
         res[:, border_wall_loc - 1, :] = 1
         res[:, -border_wall_loc, :] = 1
 
-        # to bytes
-
         res = (res * 255).clamp(0, 255).to(torch.uint8)
-
         return res

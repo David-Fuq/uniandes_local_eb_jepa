@@ -169,6 +169,51 @@ def sample_truncated_norm(upper_bound, lower_bound, mean, std=1.4):
     return torch.from_numpy(samples)
 
 
+def generate_multi_wall_layouts(config, rng=None):
+    """
+    Generate N random vertical walls with doors, ensuring minimum spacing.
+
+    Returns:
+        list of dicts with keys "wall_pos" and "door_pos", sorted by wall_pos.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    n_walls = config.n_walls
+    img_size = config.img_size
+    wall_padding = config.wall_padding
+    door_padding = config.door_padding
+    min_spacing = config.min_wall_spacing
+
+    x_min = wall_padding
+    x_max = img_size - wall_padding
+    available = x_max - x_min
+
+    required = (n_walls - 1) * min_spacing
+    if required > available:
+        raise ValueError(
+            f"Cannot fit {n_walls} walls with min_spacing={min_spacing} "
+            f"in range [{x_min}, {x_max}]"
+        )
+
+    raw = sorted(rng.uniform(0, 1, size=n_walls))
+    slack = available - required
+    wall_positions = []
+    for i, r in enumerate(raw):
+        pos = x_min + i * min_spacing + r * slack
+        wall_positions.append(pos)
+
+    door_y_min = door_padding
+    door_y_max = img_size - door_padding
+
+    walls = []
+    for wp in wall_positions:
+        door_pos = rng.uniform(door_y_min, door_y_max)
+        walls.append({"wall_pos": round(wp), "door_pos": round(door_pos)})
+
+    return walls
+
+
 def check_vertical_wall_intersect(pos1, pos2, wall_x, hole_y, door_space):
     check_intersection = (
         torch.sign(pos1[0] - wall_x) * torch.sign(pos2[0] - wall_x)

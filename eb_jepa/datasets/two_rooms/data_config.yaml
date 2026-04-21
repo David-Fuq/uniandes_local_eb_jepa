@@ -28,6 +28,8 @@ door_padding: 10
 wall_width: 3
 door_space: 4
 num_train_layouts: -1
+n_walls: 1
+min_wall_spacing: 12
 
 # Trajectory sampling
 cross_wall_rate: 0.35
