@@ -461,7 +461,11 @@ class DotWall(gym.Env):
                 curr_wall_x = wall_x[i] if wall_x.dim() > 0 else wall_x
                 curr_door_y = door_y[i] if door_y.dim() > 0 else door_y
                 # Render walls with specified locations
-                curr_wall_img = self._render_walls(curr_wall_x, curr_door_y)
+                if curr_wall_x.dim() > 0 and curr_wall_x.shape[0] > 1:
+                    walls = list(zip(curr_wall_x, curr_door_y))
+                    curr_wall_img = self._render_walls_multi(walls)
+                else:
+                    curr_wall_img = self._render_walls(curr_wall_x, curr_door_y)
             elif not hasattr(self, "wall_img"):
                 # Create temporary wall image without changing environment state
                 walls = self._generate_walls()

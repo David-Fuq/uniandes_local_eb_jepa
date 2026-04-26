@@ -832,7 +832,7 @@ class GradientDescentPlanner(Planner):
             for m in model.modules():
                 if isinstance(m, (torch.nn.RNN, torch.nn.GRU, torch.nn.LSTM)):
                     self._rnn_modules.append(m)
-
+        #Revisar qué hice acá. Red autorrecurrente (?)
     def plan(
         self, obs_init, steps_left=None, eval_mode=True, t0=False, plan_vis_path=None
     ):
@@ -850,6 +850,11 @@ class GradientDescentPlanner(Planner):
             actions = torch.zeros(
                 1, self.action_dim, plan_length, device=self.device, requires_grad=True
             )  # 1 A T
+            #Cada cuanto estoy planeando, por qué 15 pasos (puede que no sean sufcientes) quizas con menos se puede servolser
+            #Cuantos ejemplos estoy optimizando al tiempo
+            #Cree varias acciones randome al principio y optimicé las opciones al tiempo. 
+            #El algo inició con 5 acciones al tiempo, optimizarlas al tiempo y me quedé con la mejor. 
+            #Ver si con ese algoritmo tiene mucha varianza o no. 
 
             if self.optimizer_type == "adam":
                 optimizer = torch.optim.Adam([actions], lr=self.lr)
