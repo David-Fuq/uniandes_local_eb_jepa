@@ -676,6 +676,10 @@ class WallDataset(DotDataset):
 
         return bump_start_loc, bump_actions
 
+    def _select_random_wall(self, wall_locs, door_locs):
+        idx = np.random.randint(wall_locs.shape[0])
+        return wall_locs[idx : idx + 1], door_locs[idx : idx + 1]
+
     def generate_state_multi_wall(self, wall_locs, door_locs, size=None):
         """Cell-based sampling: pick a random room between walls and sample within it."""
         if size is None:
@@ -715,21 +719,25 @@ class WallDataset(DotDataset):
         if self.n_walls > 1:
             location = self.generate_state_multi_wall(wall_locs, door_locs)
             actions, bias_angle = self.generate_actions(n_steps=n_steps)
-            return location, actions, bias_angle
+        else:
+            location, actions, bias_angle = super().generate_state_and_actions(
+                wall_locs=wall_locs, door_locs=door_locs, size=size, n_steps=n_steps
+            )
 
-        location, actions, bias_angle = super().generate_state_and_actions(
-            wall_locs=wall_locs, door_locs=door_locs, size=size, n_steps=n_steps
-        )
         modified_count = 0
 
         if self.config.cross_wall_rate:
-            # cw_count = math.ceil(self.config.batch_size * self.config.cross_wall_rate)
             cw_count = np.random.rand() < self.config.cross_wall_rate
             if cw_count:
+                if self.n_walls > 1:
+                    sel_wall, sel_door = self._select_random_wall(wall_locs, door_locs)
+                else:
+                    sel_wall, sel_door = wall_locs[:cw_count], door_locs[:cw_count]
+
                 cw_locations, cw_actions, _ = (
                     self.generate_cross_wall_state_and_actions(
-                        wall_locs=wall_locs[:cw_count],
-                        door_locs=door_locs[:cw_count],
+                        wall_locs=sel_wall,
+                        door_locs=sel_door,
                         n_steps=n_steps,
                     )
                 )
@@ -737,21 +745,21 @@ class WallDataset(DotDataset):
                 actions[:cw_count] = cw_actions
                 modified_count = cw_count
 
-        # Select a proportion for wall bumping trajectories
         if hasattr(self.config, "wall_bump_rate") and self.config.wall_bump_rate > 0:
             bump_count = math.ceil(self.config.wall_bump_rate)
-            # Make sure we don't exceed batch size with combined rates
             bump_count = min(bump_count, 1 - modified_count)
 
             if bump_count > 0:
+                if self.n_walls > 1:
+                    sel_wall, sel_door = self._select_random_wall(wall_locs, door_locs)
+                else:
+                    sel_wall = wall_locs[modified_count : modified_count + bump_count]
+                    sel_door = door_locs[modified_count : modified_count + bump_count]
+
                 bump_locations, bump_actions = (
                     self.generate_wall_bump_state_and_actions(
-                        wall_locs=wall_locs[
-                            modified_count : modified_count + bump_count
-                        ],
-                        door_locs=door_locs[
-                            modified_count : modified_count + bump_count
-                        ],
+                        wall_locs=sel_wall,
+                        door_locs=sel_door,
                         n_steps=n_steps,
                     )
                 )
@@ -759,8 +767,7 @@ class WallDataset(DotDataset):
                 actions[modified_count : modified_count + bump_count] = bump_actions
                 modified_count += bump_count
 
-        # Add expert cross wall samples last
-        if self.config.expert_cross_wall_rate:
+        if self.config.expert_cross_wall_rate and self.n_walls == 1:
             (
                 ecw_locations,
                 ecw_actions,

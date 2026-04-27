@@ -163,3 +163,69 @@ class TestMultiWallDataset:
         sample = ds[0]
         assert sample.states.shape[1] == config.sample_length
         assert sample.states.shape[0] == 2  # channels: dot + wall
+
+    def test_select_random_wall_shapes_and_values(self):
+        config = _make_config(n_walls=3, fix_wall=False, size=10, val_size=10)
+        ds = WallDataset(config)
+        wall_locs = torch.tensor([20.0, 32.0, 44.0])
+        door_locs = torch.tensor([15.0, 30.0, 50.0])
+        for _ in range(20):
+            sel_w, sel_d = ds._select_random_wall(wall_locs, door_locs)
+            assert sel_w.shape == (1,)
+            assert sel_d.shape == (1,)
+            assert sel_w.item() in wall_locs.tolist()
+            assert sel_d.item() in door_locs.tolist()
+            idx = wall_locs.tolist().index(sel_w.item())
+            assert sel_d.item() == door_locs[idx].item()
+
+    def test_multi_wall_cross_wall_trajectories(self):
+        config = _make_config(
+            n_walls=2,
+            fix_wall=False,
+            size=10,
+            val_size=10,
+            n_steps=25,
+            sample_length=17,
+            cross_wall_rate=1.0,
+            expert_cross_wall_rate=0.0,
+            wall_bump_rate=0.0,
+        )
+        ds = WallDataset(config)
+        for _ in range(5):
+            sample = ds[0]
+            assert sample.states.shape[1] == config.sample_length
+            assert sample.states.shape[0] == 2
+
+    def test_multi_wall_bump_trajectories(self):
+        config = _make_config(
+            n_walls=3,
+            fix_wall=False,
+            size=10,
+            val_size=10,
+            n_steps=25,
+            sample_length=17,
+            cross_wall_rate=0.0,
+            expert_cross_wall_rate=0.0,
+            wall_bump_rate=1.0,
+        )
+        ds = WallDataset(config)
+        for _ in range(5):
+            sample = ds[0]
+            assert sample.states.shape[1] == config.sample_length
+            assert sample.states.shape[0] == 2
+
+    def test_single_wall_cross_wall_backward_compat(self):
+        config = _make_config(
+            n_walls=1,
+            size=10,
+            val_size=10,
+            n_steps=25,
+            sample_length=17,
+            cross_wall_rate=1.0,
+            expert_cross_wall_rate=0.0,
+            wall_bump_rate=0.0,
+        )
+        ds = WallDataset(config)
+        for _ in range(5):
+            sample = ds[0]
+            assert sample.states.shape[1] == config.sample_length
